@@ -1,7 +1,7 @@
 /**
  * WhatsApp Web Bridge — Multi-Session Baileys Server
- * Each platform user connects their OWN WhatsApp via QR scan.
- * Laravel calls this service to send messages from each user's number.
+ * Sessions are persisted in the Laravel database (NOT local disk).
+ * Survives Render restarts — no QR re-scan needed!
  */
 
 const express      = require('express');
@@ -11,45 +11,35 @@ const fs           = require('fs');
 const path         = require('path');
 const pino         = require('pino');
 
-// ── Baileys ────────────────────────────────────────────────────────────────
 const {
     default: makeWASocket,
     DisconnectReason,
-    useMultiFileAuthState,
     fetchLatestBaileysVersion,
     jidDecode,
     proto,
     getContentType,
     downloadContentFromMessage,
+    initAuthCreds,
+    BufferJSON,
+    proto: baileyProto,
 } = require('@whiskeysockets/baileys');
 
-const app    = express();
-const PORT   = process.env.PORT || process.env.WA_BRIDGE_PORT || 3001;  // Render uses PORT
+const app         = express();
+const PORT        = process.env.PORT || process.env.WA_BRIDGE_PORT || 3001;
 const LARAVEL_URL = process.env.LARAVEL_URL || 'http://localhost:8000';
 const API_SECRET  = process.env.WA_BRIDGE_SECRET || 'wa_bridge_secret_2024';
 
 app.use(express.json({ limit: '50mb' }));
 
-// ── Logger ─────────────────────────────────────────────────────────────────
 const logger = pino({ level: 'info' }, pino.destination('./bridge.log'));
 
-// ── Session storage ────────────────────────────────────────────────────────
-const SESSIONS_DIR = path.join(__dirname, 'sessions');
-if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-
 /** Map of userId → { sock, qr, status, phone } */
-const sessions = new Map();
-
-/**
- * Track message IDs that the BOT itself sent.
- * When a fromMe message arrives, if its ID is in this set → bot sent it → skip.
- * If the ID is NOT in the set → user typed it (e.g. in self-chat) → forward to Laravel.
- */
+const sessions  = new Map();
 const botSentIds = new Set();
 function markBotSent(msgId) {
     if (!msgId) return;
     botSentIds.add(msgId);
-    setTimeout(() => botSentIds.delete(msgId), 60_000); // auto-clean after 60s
+    setTimeout(() => botSentIds.delete(msgId), 60_000);
 }
 
 // ── Auth middleware ────────────────────────────────────────────────────────
@@ -60,13 +50,93 @@ function auth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Core: Create / reconnect a session for a user
+// REMOTE SESSION STORAGE — reads/writes to Laravel DB instead of local files
+// ─────────────────────────────────────────────────────────────────────────
+async function useRemoteAuthState(userId) {
+    const headers = { 'X-Bridge-Secret': API_SECRET, 'Content-Type': 'application/json' };
+    const base    = `${LARAVEL_URL}/api/wa-session/${userId}`;
+
+    async function readData(filename) {
+        try {
+            const res = await axios.get(`${base}/${filename}`, { headers, timeout: 8000 });
+            return JSON.parse(res.data, BufferJSON.reviver);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function writeData(filename, data) {
+        try {
+            await axios.post(
+                `${base}/${filename}`,
+                JSON.stringify(data, BufferJSON.replacer),
+                { headers, timeout: 8000 }
+            );
+        } catch (e) {
+            logger.error({ event: 'session_write_error', filename, err: e.message });
+        }
+    }
+
+    async function removeData(filename) {
+        try {
+            await axios.delete(`${base}/${filename}`, { headers, timeout: 5000 });
+        } catch (_) {}
+    }
+
+    // Load or init credentials
+    let creds = await readData('creds.json');
+    if (!creds) {
+        creds = initAuthCreds();
+        logger.info({ userId, event: 'new_creds_created' });
+    } else {
+        logger.info({ userId, event: 'creds_loaded_from_db' });
+    }
+
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    for (const id of ids) {
+                        const raw = await readData(`${type}-${id}.json`);
+                        if (raw !== null) data[id] = raw;
+                    }
+                    return data;
+                },
+                set: async (data) => {
+                    for (const [type, typeData] of Object.entries(data)) {
+                        for (const [id, value] of Object.entries(typeData)) {
+                            if (value) {
+                                await writeData(`${type}-${id}.json`, value);
+                            } else {
+                                await removeData(`${type}-${id}.json`);
+                            }
+                        }
+                    }
+                },
+            },
+        },
+        saveCreds: () => writeData('creds.json', creds),
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Create / reconnect a session
 // ─────────────────────────────────────────────────────────────────────────
 async function createSession(userId) {
-    const sessionDir = path.join(SESSIONS_DIR, `user_${userId}`);
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+    logger.info({ userId, event: 'creating_session' });
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    // Load remote auth state (from Laravel DB)
+    let authState;
+    try {
+        authState = await useRemoteAuthState(userId);
+    } catch (e) {
+        logger.error({ userId, event: 'auth_state_error', err: e.message });
+        return;
+    }
+
+    const { state, saveCreds } = authState;
     const { version }          = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -88,24 +158,24 @@ async function createSession(userId) {
     };
     sessions.set(String(userId), sessionData);
 
-    // ── QR code event ──────────────────────────────────────────────────────
+    // ── QR / connection events ─────────────────────────────────────────────
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            sessionData.qr      = qr;
-            sessionData.status  = 'qr';
+            sessionData.qr       = qr;
+            sessionData.status   = 'qr';
             sessionData.qrBase64 = await QRCode.toDataURL(qr);
             logger.info({ userId, event: 'qr_generated' });
             notifyLaravel(userId, 'qr', { qr_base64: sessionData.qrBase64 });
         }
 
         if (connection === 'open') {
-            sessionData.status  = 'connected';
-            sessionData.qr      = null;
+            sessionData.status   = 'connected';
+            sessionData.qr       = null;
             sessionData.qrBase64 = null;
             const phone = sock.user?.id?.split(':')[0] || null;
-            sessionData.phone   = phone;
+            sessionData.phone    = phone;
             logger.info({ userId, phone, event: 'connected' });
             notifyLaravel(userId, 'connected', { phone });
         }
@@ -119,273 +189,211 @@ async function createSession(userId) {
             notifyLaravel(userId, logout ? 'disconnected' : 'reconnecting', {});
 
             if (!logout) {
+                // Auto-reconnect using saved session in DB
+                logger.info({ userId, event: 'auto_reconnecting_in_3s' });
                 setTimeout(() => createSession(userId), 3000);
             } else {
+                // Logged out — clear session from DB
                 sessions.delete(String(userId));
-                fs.rmSync(sessionDir, { recursive: true, force: true });
+                const headers = { 'X-Bridge-Secret': API_SECRET };
+                axios.delete(`${LARAVEL_URL}/api/wa-session/${userId}`, { headers }).catch(() => {});
             }
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // ── Incoming messages → forward to Laravel ────────────────────────────
+    // ── Incoming messages → forward to Laravel ───────────────────────────
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
             if (!msg.message) continue;
-
-            // If the bot sent this message, its ID will be in botSentIds → skip it.
-            // If it's fromMe but NOT in botSentIds → user typed it themselves (self-chat) → forward.
             if (msg.key.fromMe && botSentIds.has(msg.key.id)) continue;
 
             const from    = msg.key.remoteJid.replace('@s.whatsapp.net', '');
             const msgType = getContentType(msg.message) || 'text';
             let   body    = '';
-            let   mediaUrl = null;
 
             if (msgType === 'conversation' || msgType === 'extendedTextMessage') {
                 body = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
             } else if (msgType === 'buttonsResponseMessage') {
-                // Handle button reply
-                body = msg.message.buttonsResponseMessage?.selectedDisplayText
-                    || msg.message.buttonsResponseMessage?.selectedButtonId
-                    || '';
+                body = msg.message.buttonsResponseMessage?.selectedDisplayText || '';
             } else if (msgType === 'listResponseMessage') {
                 body = msg.message.listResponseMessage?.title || '';
-            } else if (['imageMessage','videoMessage','audioMessage','documentMessage','stickerMessage'].includes(msgType)) {
-                const mediaMsg = msg.message[msgType];
-                body = mediaMsg?.caption || `[${msgType.replace('Message','')}]`;
-                try {
-                    const stream  = await downloadContentFromMessage(mediaMsg, msgType.replace('Message',''));
-                    const chunks  = [];
-                    for await (const chunk of stream) chunks.push(chunk);
-                    const buffer  = Buffer.concat(chunks);
-                    const ext     = mediaMsg.mimetype?.split('/')[1]?.split(';')[0] || 'bin';
-                    const fname   = `${Date.now()}_${from}.${ext}`;
-                    const savePath = path.join(__dirname, '../storage/app/public/media/incoming', fname);
-                    fs.mkdirSync(path.dirname(savePath), { recursive: true });
-                    fs.writeFileSync(savePath, buffer);
-                    mediaUrl = `/storage/media/incoming/${fname}`;
-                } catch(e) { /* media download optional */ }
+            } else {
+                body = `[${msgType.replace('Message', '')}]`;
             }
 
-            // Forward to Laravel
+            const senderName = msg.pushName || null;
+
             try {
                 await axios.post(`${LARAVEL_URL}/api/wa-bridge/incoming`, {
                     userId,
                     from,
                     body,
-                    type: msgType.replace('Message',''),
-                    media_url: mediaUrl,
+                    type: msgType.replace('Message', ''),
+                    name: senderName,
+                    msgId: msg.key.id,
                     timestamp: msg.messageTimestamp,
-                    message_id: msg.key.id,
                 }, {
                     headers: { 'X-Bridge-Secret': API_SECRET },
-                    timeout: 5000,
+                    timeout: 8000,
                 });
-            } catch(e) {
-                logger.error({ event: 'forward_failed', error: e.message });
+            } catch (e) {
+                logger.warn({ userId, event: 'forward_error', err: e.message });
             }
         }
     });
 
-    return sessionData;
+    return sock;
 }
 
-// ── Notify Laravel ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────
+// Notify Laravel of events
+// ─────────────────────────────────────────────────────────────────────────
 async function notifyLaravel(userId, event, data) {
     try {
-        await axios.post(`${LARAVEL_URL}/api/wa-bridge/status`, {
-            userId, event, ...data
-        }, {
+        await axios.post(`${LARAVEL_URL}/api/wa-bridge/status`, { userId, event, ...data }, {
             headers: { 'X-Bridge-Secret': API_SECRET },
-            timeout: 3000,
+            timeout: 8000,
         });
-    } catch (e) { /* non-critical */ }
+    } catch (e) {
+        logger.warn({ event: 'notify_laravel_error', err: e.message });
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// REST API Routes
+// HTTP Routes
 // ─────────────────────────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => res.json({ status: 'ok', sessions: sessions.size }));
+// Health check
+app.get('/health', (req, res) => {
+    const sessionList = [];
+    sessions.forEach((s, uid) => sessionList.push({ userId: uid, status: s.status, phone: s.phone }));
+    res.json({ status: 'ok', sessions: sessions.size, sessionList });
+});
 
+// Start session for user
 app.post('/session/start', auth, async (req, res) => {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
-    try {
-        const existing = sessions.get(String(userId));
-        if (existing?.status === 'connected') {
-            return res.json({ status: 'connected', phone: existing.phone });
-        }
-        await createSession(userId);
-        res.json({ status: 'starting' });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
 
-app.get('/session/qr/:userId', auth, (req, res) => {
-    const session = sessions.get(req.params.userId);
-    if (!session)          return res.status(404).json({ error: 'Session not found.' });
-    if (!session.qrBase64) return res.json({ status: session.status, qr: null });
-    res.json({ status: 'qr', qr: session.qrBase64 });
-});
-
-app.get('/session/status/:userId', auth, (req, res) => {
-    const session = sessions.get(req.params.userId);
-    if (!session) return res.json({ status: 'not_started', phone: null });
-    res.json({ status: session.status, phone: session.phone });
-});
-
-app.delete('/session/:userId', auth, async (req, res) => {
-    const session = sessions.get(req.params.userId);
-    if (!session) return res.status(404).json({ error: 'Not found' });
-    try { await session.sock.logout(); } catch(e) { }
-    sessions.delete(req.params.userId);
-    res.json({ ok: true });
-});
-
-/** POST /send — send text, media, OR interactive buttons */
-app.post('/send', auth, async (req, res) => {
-    const { userId, to, type = 'text', body, mediaUrl, caption, filename, buttons, footer } = req.body;
-    if (!userId || !to) return res.status(400).json({ error: 'userId and to are required' });
-
-    const session = sessions.get(String(userId));
-    if (!session || session.status !== 'connected') {
-        return res.status(503).json({ error: 'User not connected. Scan QR first.' });
+    const existing = sessions.get(String(userId));
+    if (existing?.status === 'connected') {
+        return res.json({ status: 'already_connected', phone: existing.phone });
     }
 
-    const jid = to.replace(/\D/g, '') + '@s.whatsapp.net';
+    createSession(userId).catch(e => logger.error({ event: 'session_start_error', err: e.message }));
+    res.json({ status: 'starting', message: 'Session starting. Poll /session/status for QR.' });
+});
+
+// Session status (includes QR if pending)
+app.get('/session/:userId/status', auth, (req, res) => {
+    const s = sessions.get(String(req.params.userId));
+    if (!s) return res.json({ status: 'not_found' });
+    res.json({
+        status:    s.status,
+        phone:     s.phone,
+        qr_base64: s.qrBase64,
+    });
+});
+
+// Get QR base64 image
+app.get('/session/:userId/qr', auth, (req, res) => {
+    const s = sessions.get(String(req.params.userId));
+    if (!s || !s.qrBase64) return res.status(404).json({ error: 'No QR available' });
+    res.json({ qr_base64: s.qrBase64 });
+});
+
+// Send text message
+app.post('/send/text', auth, async (req, res) => {
+    const { userId, to, message } = req.body;
+    const s = sessions.get(String(userId));
+    if (!s || s.status !== 'connected') return res.status(400).json({ error: 'Not connected' });
 
     try {
-        let sent;
-
-        if (type === 'buttons' && buttons && buttons.length > 0) {
-            // ── Interactive button message ─────────────────────────────────
-            const btnList = buttons.slice(0, 3).map((btn, i) => ({
-                buttonId: btn.id || String(i + 1),
-                buttonText: { displayText: btn.text },
-                type: 1,
-            }));
-
-            sent = await session.sock.sendMessage(jid, {
-                text: body || '',
-                footer: footer || '',
-                buttons: btnList,
-                headerType: 1,
-            });
-
-        } else if (type === 'list' && buttons && buttons.length > 0) {
-            // ── List message (more than 3 options) ────────────────────────
-            const rows = buttons.map((btn, i) => ({
-                title: btn.text,
-                rowId: btn.id || String(i + 1),
-                description: btn.desc || '',
-            }));
-
-            sent = await session.sock.sendMessage(jid, {
-                text: body || '',
-                footer: footer || '',
-                title: '',
-                buttonText: 'اختر خياراً',
-                sections: [{ title: 'الخيارات', rows }],
-                listType: 1,
-            });
-
-        } else if (type === 'text') {
-            sent = await session.sock.sendMessage(jid, { text: body });
-
-        } else if (type === 'image' && mediaUrl) {
-            const imgBuffer = (await axios.get(mediaUrl, { responseType: 'arraybuffer' })).data;
-            sent = await session.sock.sendMessage(jid, { image: Buffer.from(imgBuffer), caption: caption || '' });
-
-        } else if (type === 'video' && mediaUrl) {
-            const vidBuffer = (await axios.get(mediaUrl, { responseType: 'arraybuffer' })).data;
-            sent = await session.sock.sendMessage(jid, { video: Buffer.from(vidBuffer), caption: caption || '' });
-
-        } else if (type === 'audio' && mediaUrl) {
-            const audBuffer = (await axios.get(mediaUrl, { responseType: 'arraybuffer' })).data;
-            sent = await session.sock.sendMessage(jid, { audio: Buffer.from(audBuffer), mimetype: 'audio/mp4', ptt: false });
-
-        } else if (type === 'document' && mediaUrl) {
-            const docBuffer = (await axios.get(mediaUrl, { responseType: 'arraybuffer' })).data;
-            sent = await session.sock.sendMessage(jid, {
-                document: Buffer.from(docBuffer),
-                fileName: filename || 'file',
-                mimetype: 'application/octet-stream',
-                caption: caption || '',
-            });
-        } else {
-            sent = await session.sock.sendMessage(jid, { text: body || '' });
-        }
-
-        // ✅ Register this message ID so incoming handler knows it's bot-sent
-        markBotSent(sent?.key?.id);
-
-        res.json({ ok: true, message_id: sent?.key?.id });
+        const jid    = to.replace(/\D/g, '') + '@s.whatsapp.net';
+        const result = await s.sock.sendMessage(jid, { text: message });
+        markBotSent(result?.key?.id);
+        res.json({ success: true, msgId: result?.key?.id });
     } catch (e) {
-        logger.error({ event: 'send_failed', error: e.message });
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/** POST /send-bulk — send to multiple contacts */
-app.post('/send-bulk', auth, async (req, res) => {
+// Send bulk messages
+app.post('/send/bulk', auth, async (req, res) => {
     const { userId, messages, delayMs = 2000 } = req.body;
-    const session = sessions.get(String(userId));
-    if (!session || session.status !== 'connected') {
-        return res.status(503).json({ error: 'User not connected.' });
-    }
-    res.json({ ok: true, queued: messages.length });
+    const s = sessions.get(String(userId));
+    if (!s || s.status !== 'connected') return res.status(400).json({ error: 'Not connected' });
 
+    res.json({ accepted: true, count: messages.length });
+
+    // Send in background with delay
     (async () => {
         for (const m of messages) {
             try {
-                const jid = m.to.replace(/\D/g, '') + '@s.whatsapp.net';
-
-                if (m.buttons && m.buttons.length > 0) {
-                    const btnList = m.buttons.slice(0, 3).map((btn, i) => ({
-                        buttonId: btn.id || String(i + 1),
-                        buttonText: { displayText: btn.text },
-                        type: 1,
-                    }));
-                    const sent = await session.sock.sendMessage(jid, {
-                        text: m.body || '',
-                        footer: m.footer || '',
-                        buttons: btnList,
-                        headerType: 1,
-                    });
-                    markBotSent(sent?.key?.id);
-                } else {
-                    const sent = await session.sock.sendMessage(jid, { text: m.body });
-                    markBotSent(sent?.key?.id);
-                }
-
-                await new Promise(r => setTimeout(r, delayMs + Math.random() * 1000));
-            } catch(e) {
-                logger.error({ event: 'bulk_send_error', to: m.to, error: e.message });
+                const jid    = m.to.replace(/\D/g, '') + '@s.whatsapp.net';
+                const result = await s.sock.sendMessage(jid, { text: m.body });
+                markBotSent(result?.key?.id);
+                logger.info({ userId, to: m.to, event: 'message_sent' });
+            } catch (e) {
+                logger.error({ userId, to: m.to, event: 'send_error', err: e.message });
             }
+            await new Promise(r => setTimeout(r, delayMs));
         }
+        logger.info({ userId, event: 'bulk_complete', count: messages.length });
     })();
 });
 
-// ── Restore sessions on startup ────────────────────────────────────────────
-async function restoreSessions() {
-    if (!fs.existsSync(SESSIONS_DIR)) return;
-    const dirs = fs.readdirSync(SESSIONS_DIR).filter(d => d.startsWith('user_'));
-    for (const dir of dirs) {
-        const userId = dir.replace('user_', '');
-        logger.info({ event: 'restoring_session', userId });
-        try { await createSession(userId); } catch(e) { }
+// Disconnect / logout session
+app.post('/session/:userId/disconnect', auth, async (req, res) => {
+    const s = sessions.get(String(req.params.userId));
+    if (s?.sock) {
+        try { await s.sock.logout(); } catch (_) {}
+    }
+    sessions.delete(String(req.params.userId));
+    // Clear DB session
+    const headers = { 'X-Bridge-Secret': API_SECRET };
+    axios.delete(`${LARAVEL_URL}/api/wa-session/${req.params.userId}`, { headers }).catch(() => {});
+    res.json({ ok: true });
+});
+
+// List active sessions
+app.get('/sessions', auth, (req, res) => {
+    const list = [];
+    sessions.forEach((s, uid) => list.push({ userId: uid, status: s.status, phone: s.phone }));
+    res.json({ sessions: list });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Startup — restore all sessions from DB
+// ─────────────────────────────────────────────────────────────────────────
+async function restoreSessionsFromDB() {
+    logger.info({ event: 'restoring_sessions_from_db' });
+    try {
+        // Get unique user IDs from wa_sessions table
+        const res = await axios.get(`${LARAVEL_URL}/api/wa-session/active-users`, {
+            headers: { 'X-Bridge-Secret': API_SECRET },
+            timeout: 10000,
+        });
+        const userIds = res.data?.userIds || [];
+        logger.info({ event: 'found_sessions', count: userIds.length, userIds });
+
+        for (const uid of userIds) {
+            await createSession(uid);
+            await new Promise(r => setTimeout(r, 1000)); // stagger
+        }
+    } catch (e) {
+        logger.warn({ event: 'restore_sessions_error', err: e.message });
     }
 }
 
 app.listen(PORT, async () => {
-    console.log(`\n🟢 WA Bridge running on port ${PORT}`);
-    console.log(`📡 Forwarding events to: ${LARAVEL_URL}`);
-    console.log(`🔑 Secret: ${API_SECRET}\n`);
-    await restoreSessions();
+    logger.info({ event: 'bridge_started', port: PORT, laravel: LARAVEL_URL });
+    console.log(`✅ WA Bridge running on port ${PORT}`);
+    console.log(`🔗 Laravel: ${LARAVEL_URL}`);
+    // Wait for connections to settle then restore sessions
+    setTimeout(restoreSessionsFromDB, 4000);
 });
