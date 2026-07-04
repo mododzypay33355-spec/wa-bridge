@@ -202,15 +202,19 @@ async function createSession(userId, pairingPhone = null) {
             const logout = code === DisconnectReason.loggedOut;
             logger.warn({ userId, code, logout, event: 'disconnected' });
 
+            // Don't auto-reconnect if we are intentionally re-pairing
+            if (sessionData._preventReconnect) {
+                logger.info({ userId, event: 'reconnect_suppressed_for_repairing' });
+                return;
+            }
+
             sessionData.status = logout ? 'disconnected' : 'reconnecting';
             notifyLaravel(userId, logout ? 'disconnected' : 'reconnecting', {});
 
             if (!logout) {
-                // Auto-reconnect using saved session in DB
                 logger.info({ userId, event: 'auto_reconnecting_in_3s' });
                 setTimeout(() => createSession(userId), 3000);
             } else {
-                // Logged out — clear session from DB
                 sessions.delete(String(userId));
                 const headers = { 'X-Bridge-Secret': API_SECRET };
                 axios.delete(`${LARAVEL_URL}/api/wa-session/${userId}`, { headers }).catch(() => {});
@@ -310,28 +314,54 @@ app.post('/session/pair', auth, async (req, res) => {
     const { userId, phone } = req.body;
     if (!userId || !phone) return res.status(400).json({ error: 'userId and phone required' });
 
-    const existing = sessions.get(String(userId));
+    const cleanPhone = String(phone).replace(/\D/g, '');
+    const existing   = sessions.get(String(userId));
+
+    // Already connected
     if (existing?.status === 'connected') {
         return res.json({ status: 'already_connected', phone: existing.phone });
     }
 
-    // Kill old session if exists
-    if (existing?.sock) {
-        try { existing.sock.end(); } catch (_) {}
+    // ── Strategy 1: existing socket in QR/connecting state → request code directly ──
+    if (existing?.sock && ['qr', 'connecting', 'pairing'].includes(existing.status)) {
+        try {
+            logger.info({ userId, event: 'requesting_pairing_code_from_existing_sock', phone: cleanPhone });
+            const code = await existing.sock.requestPairingCode(cleanPhone);
+            existing.pairingCode = code;
+            existing.status      = 'pairing';
+            logger.info({ userId, code, event: 'pairing_code_ok' });
+            return res.json({ status: 'pairing', pairing_code: code, phone: cleanPhone });
+        } catch (e) {
+            logger.warn({ userId, event: 'pairing_code_failed_on_existing', err: e.message });
+            // Fall through to create fresh session
+        }
+    }
+
+    // ── Strategy 2: kill old session (suppressing auto-reconnect) and start fresh ──
+    if (existing) {
+        existing._preventReconnect = true;   // stop auto-reconnect on close
+        try { existing.sock?.end(); } catch (_) {}
         sessions.delete(String(userId));
+        await new Promise(r => setTimeout(r, 1500));  // let close event fire
     }
 
-    // Start session in pairing code mode
-    createSession(userId, phone).catch(e => logger.error({ event: 'pair_error', err: e.message }));
+    // Start fresh session in pairing mode
+    createSession(userId, cleanPhone).catch(e => logger.error({ event: 'pair_error', err: e.message }));
 
-    // Wait a few seconds for pairing code to generate
-    await new Promise(r => setTimeout(r, 6000));
-
-    const s = sessions.get(String(userId));
-    if (s?.pairingCode) {
-        return res.json({ status: 'pairing', pairing_code: s.pairingCode, phone });
+    // Wait up to 12 s for pairing code
+    for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const s = sessions.get(String(userId));
+        if (s?.pairingCode) {
+            return res.json({ status: 'pairing', pairing_code: s.pairingCode, phone: cleanPhone });
+        }
+        if (s?.status === 'connected') {
+            return res.json({ status: 'already_connected', phone: s.phone });
+        }
     }
-    res.json({ status: 'starting', message: 'Pairing code generating, poll /session/:userId/status' });
+
+    // Code not ready yet — tell client to poll
+    res.json({ status: 'starting', message: 'Pairing code is generating, poll /session/:userId/status' });
 });
 
 // Session status (includes QR or pairing code if pending)
