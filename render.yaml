@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: wa-bridge
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: WA_BRIDGE_PORT
+        value: 10000
+      - key: LARAVEL_URL
+        value: https://deltahome.online
+      - key: WA_BRIDGE_SECRET
+        value: wa_bridge_secret_2024
+      - key: NODE_ENV
+        value: production
