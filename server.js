@@ -4,6 +4,9 @@
  * Survives Render restarts — no QR re-scan needed!
  */
 
+// Load .env file if present
+try { require('dotenv').config(); } catch(_) {}
+
 const express      = require('express');
 const QRCode       = require('qrcode');
 const axios        = require('axios');
@@ -26,12 +29,23 @@ const {
 
 const app         = express();
 const PORT        = process.env.PORT || process.env.WA_BRIDGE_PORT || 3001;
-const LARAVEL_URL = process.env.LARAVEL_URL || 'http://localhost:8000';
+// Always fallback to the production Laravel URL — never localhost
+const LARAVEL_URL = process.env.LARAVEL_URL || 'https://deltahome.online';
 const API_SECRET  = process.env.WA_BRIDGE_SECRET || 'wa_bridge_secret_2024';
 
 app.use(express.json({ limit: '50mb' }));
 
 const logger = pino({ level: 'info' }, pino.destination('./bridge.log'));
+
+// ── Global crash protection ────────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+    logger.error({ event: 'uncaughtException', err: err.message, stack: err.stack });
+    console.error('Uncaught Exception (bridge continues):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+    logger.error({ event: 'unhandledRejection', reason: String(reason) });
+    console.error('Unhandled Rejection (bridge continues):', reason);
+});
 
 /** Map of userId → { sock, qr, status, phone } */
 const sessions  = new Map();
@@ -58,7 +72,12 @@ async function useRemoteAuthState(userId) {
 
     async function readData(filename) {
         try {
-            const res = await axios.get(`${base}/${filename}`, { headers, timeout: 8000 });
+            const res = await axios.get(`${base}/${filename}`, {
+                headers,
+                timeout: 8000,
+                responseType: 'text',   // ← get raw string so JSON.parse+reviver works
+            });
+            if (!res.data) return null;
             return JSON.parse(res.data, BufferJSON.reviver);
         } catch (e) {
             return null;
@@ -137,18 +156,28 @@ async function createSession(userId, pairingPhone = null) {
     }
 
     const { state, saveCreds } = authState;
-    const { version }          = await fetchLatestBaileysVersion();
+    let version;
+    try { ({ version } = await fetchLatestBaileysVersion()); } catch(_) { version = [2,3000,1015901307]; }
 
-    const sock = makeWASocket({
-        version,
-        auth: state,
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        browser: ['WA Marketing SaaS', 'Chrome', '1.0.0'],
-        syncFullHistory: false,
-        // Required for pairing code method
-        mobile: false,
-    });
+    let sock;
+    try {
+        sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: ['WA Marketing SaaS', 'Chrome', '1.0.0'],
+            syncFullHistory: false,
+            mobile: false,
+        });
+    } catch (e) {
+        logger.error({ userId, event: 'make_socket_error', err: e.message });
+        // Corrupted creds — clear and retry fresh
+        try { await axios.delete(`${LARAVEL_URL}/api/wa-session/${userId}`, { headers: { 'X-Bridge-Secret': API_SECRET }, timeout: 5000 }); } catch(_) {}
+        sessions.delete(String(userId));
+        setTimeout(() => createSession(userId), 2000);
+        return;
+    }
 
 
     const sessionData = {

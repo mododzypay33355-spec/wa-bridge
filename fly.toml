@@ -1,0 +1,37 @@
+app = "wa-bridge-delta"
+primary_region = "ams"  # Amsterdam (closest to Egypt)
+
+[build]
+
+[env]
+  PORT = "3001"
+  LARAVEL_URL = "https://deltahome.online"
+  WA_BRIDGE_SECRET = "wa_bridge_secret_2024"
+  NODE_ENV = "production"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 3001
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "5s"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

@@ -1,3 +1,6 @@
-sessions/
-bridge.log
+node_modules/
 *.log
+.env
+bridge.log
+auth_info/
+sessions/
