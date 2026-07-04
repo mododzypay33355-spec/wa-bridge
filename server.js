@@ -124,8 +124,8 @@ async function useRemoteAuthState(userId) {
 // ─────────────────────────────────────────────────────────────────────────
 // Create / reconnect a session
 // ─────────────────────────────────────────────────────────────────────────
-async function createSession(userId) {
-    logger.info({ userId, event: 'creating_session' });
+async function createSession(userId, pairingPhone = null) {
+    logger.info({ userId, event: 'creating_session', pairingPhone });
 
     // Load remote auth state (from Laravel DB)
     let authState;
@@ -146,7 +146,10 @@ async function createSession(userId) {
         logger: pino({ level: 'silent' }),
         browser: ['WA Marketing SaaS', 'Chrome', '1.0.0'],
         syncFullHistory: false,
+        // Required for pairing code method
+        mobile: false,
     });
+
 
     const sessionData = {
         sock,
@@ -163,11 +166,25 @@ async function createSession(userId) {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            sessionData.qr       = qr;
-            sessionData.status   = 'qr';
-            sessionData.qrBase64 = await QRCode.toDataURL(qr);
-            logger.info({ userId, event: 'qr_generated' });
-            notifyLaravel(userId, 'qr', { qr_base64: sessionData.qrBase64 });
+            if (pairingPhone) {
+                // ── PAIRING CODE MODE: generate 8-digit code ──────────────
+                try {
+                    const code = await sock.requestPairingCode(pairingPhone.replace(/\D/g, ''));
+                    sessionData.pairingCode = code;
+                    sessionData.status      = 'pairing';
+                    logger.info({ userId, event: 'pairing_code_generated', code });
+                    notifyLaravel(userId, 'pairing_code', { pairing_code: code, phone: pairingPhone });
+                } catch (e) {
+                    logger.error({ userId, event: 'pairing_code_error', err: e.message });
+                }
+            } else {
+                // ── QR CODE MODE ──────────────────────────────────────────
+                sessionData.qr       = qr;
+                sessionData.status   = 'qr';
+                sessionData.qrBase64 = await QRCode.toDataURL(qr);
+                logger.info({ userId, event: 'qr_generated' });
+                notifyLaravel(userId, 'qr', { qr_base64: sessionData.qrBase64 });
+            }
         }
 
         if (connection === 'open') {
@@ -274,7 +291,7 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', sessions: sessions.size, sessionList });
 });
 
-// Start session for user
+// Start session for user (QR mode)
 app.post('/session/start', auth, async (req, res) => {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
@@ -288,14 +305,44 @@ app.post('/session/start', auth, async (req, res) => {
     res.json({ status: 'starting', message: 'Session starting. Poll /session/status for QR.' });
 });
 
-// Session status (includes QR if pending)
+// Start session with PAIRING CODE (phone number method — more reliable)
+app.post('/session/pair', auth, async (req, res) => {
+    const { userId, phone } = req.body;
+    if (!userId || !phone) return res.status(400).json({ error: 'userId and phone required' });
+
+    const existing = sessions.get(String(userId));
+    if (existing?.status === 'connected') {
+        return res.json({ status: 'already_connected', phone: existing.phone });
+    }
+
+    // Kill old session if exists
+    if (existing?.sock) {
+        try { existing.sock.end(); } catch (_) {}
+        sessions.delete(String(userId));
+    }
+
+    // Start session in pairing code mode
+    createSession(userId, phone).catch(e => logger.error({ event: 'pair_error', err: e.message }));
+
+    // Wait a few seconds for pairing code to generate
+    await new Promise(r => setTimeout(r, 6000));
+
+    const s = sessions.get(String(userId));
+    if (s?.pairingCode) {
+        return res.json({ status: 'pairing', pairing_code: s.pairingCode, phone });
+    }
+    res.json({ status: 'starting', message: 'Pairing code generating, poll /session/:userId/status' });
+});
+
+// Session status (includes QR or pairing code if pending)
 app.get('/session/:userId/status', auth, (req, res) => {
     const s = sessions.get(String(req.params.userId));
     if (!s) return res.json({ status: 'not_found' });
     res.json({
-        status:    s.status,
-        phone:     s.phone,
-        qr_base64: s.qrBase64,
+        status:       s.status,
+        phone:        s.phone,
+        qr_base64:    s.qrBase64,
+        pairing_code: s.pairingCode || null,
     });
 });
 
